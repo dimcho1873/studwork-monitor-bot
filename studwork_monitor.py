@@ -25,7 +25,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # Gemini
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = genai.GenerativeModel("gemini-2.5-flash")
+MODEL = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 # -------------------- ФУНКЦИИ --------------------
 def load_processed_ids():
