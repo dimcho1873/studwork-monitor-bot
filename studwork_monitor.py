@@ -15,7 +15,7 @@ import google.generativeai as genai
 
 # -------------------- НАСТРОЙКИ --------------------
 API_URL = "https://api.studwork.ru/orders?type_ids[]=1&type_ids[]=2&type_ids[]=10&type_ids[]=11&type_ids[]=12&type_ids[]=17&type_ids[]=18&type_ids[]=34&type_ids[]=35&type_ids[]=36&type_ids[]=20&type_ids[]=24&type_ids[]=15&type_ids[]=6&type_ids[]=19&discipline_group_ids[]=2&discipline_group_ids[]=5&discipline_group_ids[]=6&discipline_group_ids[]=7&discipline_group_ids[]=8&discipline_group_ids[]=9&discipline_group_ids[]=4&my_disciplines=false&my_types=false&showHiddenOrders=false"
-ORDERS_LIMIT = 5
+ORDERS_LIMIT = 20
 
 PROCESSED_IDS_FILE = Path("processed_ids.json")
 
