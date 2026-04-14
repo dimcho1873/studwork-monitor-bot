@@ -1,7 +1,7 @@
 name: Studwork Monitor with Selenium
 
 on:
-  
+  schedule:
     - cron: '*/15 * * * *'   # раз в 15 минут, чтобы точно уложиться по времени
   workflow_dispatch:
 
