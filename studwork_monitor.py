@@ -14,7 +14,7 @@ import google.generativeai as genai
 
 # -------------------- НАСТРОЙКИ --------------------
 API_URL = "https://api.studwork.ru/orders?type_ids[]=1&type_ids[]=2&type_ids[]=10&type_ids[]=11&type_ids[]=12&type_ids[]=17&type_ids[]=18&type_ids[]=34&type_ids[]=35&type_ids[]=36&type_ids[]=20&type_ids[]=24&type_ids[]=15&type_ids[]=6&type_ids[]=19&discipline_group_ids[]=2&discipline_group_ids[]=5&discipline_group_ids[]=6&discipline_group_ids[]=7&discipline_group_ids[]=8&discipline_group_ids[]=9&discipline_group_ids[]=4&my_disciplines=false&my_types=false&showHiddenOrders=false"
-ORDERS_LIMIT = 5   # ограничим число просматриваемых страниц, чтобы не превысить время
+ORDERS_LIMIT = 5   # сколько заказов проверяем за один запуск
 
 PROCESSED_IDS_FILE = Path("processed_ids.json")
 
@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # Gemini
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = genai.GenerativeModel("gemini-3-flash-preview")
+MODEL = genai.GenerativeModel("gemini-2.0-flash")   # 1M контекст – HTML поместится
 
 # -------------------- ФУНКЦИИ --------------------
 def load_processed_ids():
@@ -66,107 +66,64 @@ def get_selenium_driver():
     chrome_options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
-    # Автоматическая установка драйвера
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
-def scrape_order_page(driver, order):
-    """Парсим страницу заказа, возвращаем словарь с дополнительной информацией."""
+def get_order_html(driver, order):
+    """
+    Загружает страницу заказа и возвращает HTML-код блока <div class="order">
+    (или всей страницы, если блок не найден).
+    """
     url = build_order_link(order)
     driver.get(url)
-    time.sleep(2)  # Даём странице подгрузиться
-
-    info = {
-        "description": "",
-        "files": [],
-        "deadline": "",
-        "price_exact": order.get("price", "не указана"),
-    }
+    time.sleep(2)
 
     try:
-        # Ждём появления основного контента
+        # Ждём появления основного блока заказа
         WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.order-view"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.order"))
         )
+        order_element = driver.find_element(By.CSS_SELECTOR, "div.order")
+        html_content = order_element.get_attribute("outerHTML")
+        print(f"  HTML блока заказа получен, длина: {len(html_content)} символов")
+        return html_content
     except Exception as e:
-        print(f"Не дождались загрузки страницы: {e}")
-        return info
+        print(f"  Не удалось найти div.order, возвращаем HTML всей страницы. Ошибка: {e}")
+        return driver.page_source
 
-    # Текст заказа (обычно в div с классом order-view__description или подобном)
-    try:
-        desc_elem = driver.find_element(By.CSS_SELECTOR, "div.order-view__description")
-        info["description"] = desc_elem.text.strip()
-    except:
-        # Альтернативные селекторы
-        try:
-            desc_elem = driver.find_element(By.CSS_SELECTOR, "div.task-description")
-            info["description"] = desc_elem.text.strip()
-        except:
-            pass
-
-    # Файлы (могут быть в виде списка с названиями)
-    try:
-        file_elems = driver.find_elements(By.CSS_SELECTOR, "div.order-view__files a, div.files-list a")
-        info["files"] = [f.text.strip() for f in file_elems if f.text.strip()]
-    except:
-        pass
-
-    # Срок выполнения (часто в блоке с информацией)
-    try:
-        deadline_elem = driver.find_element(By.CSS_SELECTOR, "div.order-view__info-item--deadline span.value, span.deadline")
-        info["deadline"] = deadline_elem.text.strip()
-    except:
-        pass
-
-    # Точная цена, если указана (иногда "Предлагайте", тогда оставляем из API)
-    try:
-        price_elem = driver.find_element(By.CSS_SELECTOR, "div.order-view__price span.value, span.price-value")
-        price_text = price_elem.text.strip()
-        if price_text and price_text.lower() not in ["предлагайте", "договорная"]:
-            info["price_exact"] = price_text
-    except:
-        pass
-
-    return info
-
-def ask_gemini(order, scraped_info):
-    """Расширенный запрос к Gemini с полными данными."""
+def ask_gemini(order, html_content):
+    """
+    Отправляет HTML заказа в Gemini и просит определить,
+    можно ли выполнить этот заказ с помощью ИИ.
+    """
     topic = order.get("topic", "Без названия")
     work_type = order.get("workType", {}).get("name", "Не указан")
     discipline = order.get("discipline", "Не указана")
-    price = scraped_info.get("price_exact") or order.get("price", "не указана")
-    offers = order.get("offersCount", 0)
-    description = scraped_info.get("description", "Описание отсутствует")
-    files = scraped_info.get("files", [])
-    deadline = scraped_info.get("deadline", "не указан")
 
     prompt = f"""
-Ты – эксперт по оценке учебных и фриланс-заказов. Проанализируй заказ и ответь ТОЛЬКО "да" или "нет".
+Ты — эксперт по оценке заказов на фриланс-бирже. Тебе предоставлен HTML-код страницы заказа с сайта Studwork.
+Твоя задача: проанализировать содержимое страницы и ответить **только "да" или "нет"**.
 
-Критерии "да":
-- Заказ можно выполнить полностью с помощью современных языковых моделей (написание текста, реферат, ответы на вопросы, перевод, программирование простых скриптов, решение типовых задач).
-- Не требует физического присутствия, сложных расчётов в специализированном ПО, работы с закрытыми базами или уникального творчества.
-- Объём небольшой или средний.
+Критерии ответа "да":
+- Заказ можно полностью выполнить с помощью современных языковых моделей (написание текста, реферат, ответы на вопросы, перевод, программирование простых скриптов, решение типовых задач).
+- Не требуется физического присутствия, работы со специализированным ПО без API, уникальных творческих навыков.
+- Объём работы небольшой или средний.
 
-Критерии "нет":
-- Требуется работа с файлами, которые ИИ не может открыть (например, специфические чертежи).
-- Нужна личная встреча, экзамен онлайн с прокторингом, лабораторная в специальной программе.
+Критерии ответа "нет":
+- Требуется работа с файлами, которые ИИ не может прочитать (например, чертежи в специализированных форматах).
+- Нужна личная встреча, экзамен с прокторингом, лабораторная работа в проприетарной среде.
 - Узкоспециализированная тема, где высока вероятность ошибки ИИ.
 
-Информация о заказе:
+Краткие данные из API:
 Тема: {topic}
 Тип работы: {work_type}
 Дисциплина: {discipline}
-Цена: {price}
-Количество откликов: {offers}
-Срок сдачи: {deadline}
-Прикреплённые файлы: {", ".join(files) if files else "нет"}
 
-Описание заказа:
-{description[:1000]}
+HTML-код страницы заказа:
+{html_content[:900000]}   # ограничиваем на всякий случай (модель принимает до 1 млн токенов)
 
-Подходит ли этот заказ для выполнения с помощью ИИ? (ответь только "да" или "нет")
+Подходит ли этот заказ для выполнения с помощью ИИ? Ответь только "да" или "нет".
 """
     try:
         response = MODEL.generate_content(prompt)
@@ -182,40 +139,32 @@ def send_telegram_message(text):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": False   # пусть показывается превью ссылки
     }
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Ошибка отправки в Telegram: {e}")
 
-def format_order_message(order, scraped_info):
+def format_order_message(order):
     link = build_order_link(order)
     topic = order.get("topic", "Без названия")
     work_type = order.get("workType", {}).get("name", "—")
     discipline = order.get("discipline", "—")
-    price = scraped_info.get("price_exact") or order.get("price", "не указана")
+    price = order.get("price", "не указана")
     offers = order.get("offersCount", 0)
-    deadline = scraped_info.get("deadline", "не указан")
-    files = scraped_info.get("files", [])
-    files_text = "\n".join(f"📎 {f}" for f in files) if files else "нет"
-    description = scraped_info.get("description", "")
-    short_desc = description[:150] + "..." if len(description) > 150 else description
 
     return (
-        f"🔔 <b>Новый подходящий заказ!</b>\n\n"
+        f"🔔 <b>Найден подходящий заказ!</b>\n\n"
         f"📌 <b>{topic}</b>\n"
         f"📚 {work_type} | {discipline}\n"
         f"💰 Цена: {price}\n"
-        f"⏰ Срок: {deadline}\n"
         f"👥 Откликов: {offers}\n"
-        f"📄 Описание: {short_desc}\n"
-        f"📎 Файлы: {files_text}\n"
         f"🔗 <a href='{link}'>Открыть заказ</a>"
     )
 
 def main():
-    print("Запуск мониторинга заказов с парсингом страниц...")
+    print("Запуск мониторинга заказов с передачей HTML в Gemini...")
     processed = load_processed_ids()
     orders = fetch_orders()
     print(f"Получено заказов: {len(orders)}")
@@ -224,7 +173,6 @@ def main():
         print("Нет заказов для проверки.")
         return
 
-    # Инициализируем драйвер один раз для всех заказов
     driver = get_selenium_driver()
     new_processed = set()
 
@@ -235,20 +183,18 @@ def main():
                 continue
 
             print(f"Обработка заказа #{order_id}: {order.get('topic', '')[:50]}...")
-            scraped_info = scrape_order_page(driver, order)
-            print(f"  Собрано: описание {len(scraped_info['description'])} симв, файлов {len(scraped_info['files'])}")
+            html_content = get_order_html(driver, order)
 
-            if ask_gemini(order, scraped_info):
+            if ask_gemini(order, html_content):
                 print(f"✅ Подходит! Отправляю в Telegram.")
-                msg = format_order_message(order, scraped_info)
+                msg = format_order_message(order)
                 send_telegram_message(msg)
                 time.sleep(0.5)
             else:
                 print(f"❌ Не подходит.")
 
             new_processed.add(order_id)
-            # Пауза между заказами, чтобы не нагружать сервер
-            time.sleep(3)
+            time.sleep(3)   # пауза между заказами
 
     finally:
         driver.quit()
