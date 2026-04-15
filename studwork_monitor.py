@@ -11,7 +11,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-import google.generativeai as genai
 
 # -------------------- НАСТРОЙКИ --------------------
 API_URL = "https://api.studwork.ru/orders?type_ids[]=1&type_ids[]=2&type_ids[]=10&type_ids[]=11&type_ids[]=12&type_ids[]=17&type_ids[]=18&type_ids[]=34&type_ids[]=35&type_ids[]=36&type_ids[]=20&type_ids[]=24&type_ids[]=15&type_ids[]=6&type_ids[]=19&discipline_group_ids[]=2&discipline_group_ids[]=5&discipline_group_ids[]=6&discipline_group_ids[]=7&discipline_group_ids[]=8&discipline_group_ids[]=9&discipline_group_ids[]=4&my_disciplines=false&my_types=false&showHiddenOrders=false"
@@ -23,9 +22,10 @@ PROCESSED_IDS_FILE = Path("processed_ids.json")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Gemini
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = genai.GenerativeModel("gemini-2.5-flash-lite")
+# Codestral (Mistral AI) - OpenAI-совместимый API
+CODESTRAL_API_KEY = os.environ["CODESTRAL_API_KEY"]
+CODESTRAL_API_BASE = "https://codestral.mistral.ai/v1"
+CODESTRAL_MODEL = "codestral-latest"
 
 # -------------------- ФУНКЦИИ --------------------
 def load_processed_ids():
@@ -87,9 +87,9 @@ def get_order_html(driver, order):
         print(f"  Не удалось найти div.order, возвращаем HTML всей страницы. Ошибка: {e}")
         return driver.page_source
 
-def ask_gemini(order, html_content):
+def ask_codestral(order, html_content):
     """
-    Анализирует HTML страницы заказа через Gemini.
+    Анализирует HTML страницы заказа через Codestral (Mistral AI).
     Возвращает словарь с полями:
         suitable (bool)
         reason (str, если не подходит)
@@ -149,19 +149,40 @@ HTML страницы (обрезан до 800 тыс. символов):
 
 ТОЛЬКО JSON В ОТВЕТЕ.
 """
+
+    url = f"{CODESTRAL_API_BASE}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {CODESTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": CODESTRAL_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        # "response_format": {"type": "json_object"}  # Codestral поддерживает? Если нет – удалить.
+    }
+
     try:
-        response = MODEL.generate_content(prompt)
-        text = response.text.strip()
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        # Извлекаем текст ответа модели
+        text = data["choices"][0]["message"]["content"].strip()
+
         # Удаляем возможные Markdown-обёртки ```json ... ```
         text = re.sub(r'^```json\s*', '', text)
         text = re.sub(r'\s*```$', '', text)
-        data = json.loads(text)
+
+        result = json.loads(text)
         # Приводим suitable к bool
-        data['suitable'] = bool(data.get('suitable', False))
-        return data
+        result['suitable'] = bool(result.get('suitable', False))
+        return result
     except Exception as e:
-        print(f"Ошибка при обращении к Gemini или парсинге JSON: {e}")
-        print("Ответ модели:", text[:200] if 'text' in locals() else "нет ответа")
+        print(f"Ошибка при обращении к Codestral или парсинге JSON: {e}")
+        if 'text' in locals():
+            print("Ответ модели:", text[:200])
+        else:
+            print("Нет ответа от модели")
         return None
 
 def send_telegram_message(text):
@@ -178,7 +199,7 @@ def send_telegram_message(text):
         print(f"Ошибка отправки в Telegram: {e}")
 
 def format_order_message(order, analysis):
-    """Формирует красивое HTML-сообщение для Telegram на основе анализа Gemini."""
+    """Формирует красивое HTML-сообщение для Telegram на основе анализа Codestral."""
     link = build_order_link(order)
 
     title = analysis.get('title', order.get('topic', 'Без названия'))
@@ -208,7 +229,7 @@ def format_order_message(order, analysis):
     return msg
 
 def main():
-    print("Запуск мониторинга заказов с расширенным анализом Gemini...")
+    print("Запуск мониторинга заказов с анализом через Codestral (Mistral AI)...")
     processed = load_processed_ids()
     orders = fetch_orders()
     print(f"Получено заказов: {len(orders)}")
@@ -229,9 +250,9 @@ def main():
             print(f"\nОбработка заказа #{order_id}: {order.get('topic', '')[:50]}...")
             html_content = get_order_html(driver, order)
 
-            analysis = ask_gemini(order, html_content)
+            analysis = ask_codestral(order, html_content)
             if analysis is None:
-                print("  ❌ Не удалось получить анализ от Gemini.")
+                print("  ❌ Не удалось получить анализ от Codestral.")
                 new_processed.add(order_id)  # всё равно помечаем как обработанный, чтобы не зацикливаться
                 continue
 
