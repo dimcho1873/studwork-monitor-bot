@@ -11,6 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+import google.generativeai as genai
 
 # -------------------- НАСТРОЙКИ --------------------
 API_URL = "https://api.studwork.ru/orders?type_ids[]=1&type_ids[]=2&type_ids[]=10&type_ids[]=11&type_ids[]=12&type_ids[]=17&type_ids[]=18&type_ids[]=34&type_ids[]=35&type_ids[]=36&type_ids[]=20&type_ids[]=24&type_ids[]=15&type_ids[]=6&type_ids[]=19&discipline_group_ids[]=2&discipline_group_ids[]=5&discipline_group_ids[]=6&discipline_group_ids[]=7&discipline_group_ids[]=8&discipline_group_ids[]=9&discipline_group_ids[]=4&my_disciplines=false&my_types=false&showHiddenOrders=false"
@@ -22,10 +23,9 @@ PROCESSED_IDS_FILE = Path("processed_ids.json")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Google AI Studio (Gemma 4)
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMMA_MODEL = "gemma-4-31b-it"  # инструктивная версия Gemma 4 31B
-API_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMMA_MODEL}:generateContent"
+# Gemini
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = genai.GenerativeModel("gemini-3.1-flash-lite-preview")
 
 # -------------------- ФУНКЦИИ --------------------
 def load_processed_ids():
@@ -87,10 +87,20 @@ def get_order_html(driver, order):
         print(f"  Не удалось найти div.order, возвращаем HTML всей страницы. Ошибка: {e}")
         return driver.page_source
 
-def ask_gemma(order, html_content):
+def ask_gemini(order, html_content):
     """
-    Анализирует HTML страницы заказа через Gemma 4 31B.
-    Возвращает словарь с полями или None в случае ошибки.
+    Анализирует HTML страницы заказа через Gemini.
+    Возвращает словарь с полями:
+        suitable (bool)
+        reason (str, если не подходит)
+        title (str)
+        description (str)
+        price (str)
+        deadline (str)
+        user_name (str)
+        difficulty (str)
+        summary (str)
+    Если ответ не удалось распарсить, возвращает None.
     """
     topic = order.get("topic", "Без названия")
     work_type = order.get("workType", {}).get("name", "Не указан")
@@ -139,59 +149,19 @@ HTML страницы (обрезан до 800 тыс. символов):
 
 ТОЛЬКО JSON В ОТВЕТЕ.
 """
-
-    # Параметры запроса
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 2048,
-        }
-    }
-
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
-
     try:
-        response = requests.post(API_ENDPOINT, headers=headers, params=params, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-
-        # Извлекаем текст ответа
-        candidates = data.get("candidates", [])
-        if not candidates:
-            print("  ⚠️ Пустой ответ от Gemma")
-            return None
-
-        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-        if not text:
-            print("  ⚠️ Текст ответа отсутствует")
-            return None
-
+        response = MODEL.generate_content(prompt)
+        text = response.text.strip()
         # Удаляем возможные Markdown-обёртки ```json ... ```
         text = re.sub(r'^```json\s*', '', text)
         text = re.sub(r'\s*```$', '', text)
-
-        parsed = json.loads(text)
-        parsed['suitable'] = bool(parsed.get('suitable', False))
-        return parsed
-
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ Ошибка HTTP при вызове Gemma: {e}")
-        if hasattr(e, 'response') and e.response:
-            print(f"  Ответ сервера: {e.response.text[:200]}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"  ❌ Ошибка парсинга JSON от Gemma: {e}")
-        print(f"  Полученный текст: {text[:200]}")
-        return None
+        data = json.loads(text)
+        # Приводим suitable к bool
+        data['suitable'] = bool(data.get('suitable', False))
+        return data
     except Exception as e:
-        print(f"  ❌ Неожиданная ошибка: {e}")
+        print(f"Ошибка при обращении к Gemini или парсинге JSON: {e}")
+        print("Ответ модели:", text[:200] if 'text' in locals() else "нет ответа")
         return None
 
 def send_telegram_message(text):
@@ -208,7 +178,7 @@ def send_telegram_message(text):
         print(f"Ошибка отправки в Telegram: {e}")
 
 def format_order_message(order, analysis):
-    """Формирует красивое HTML-сообщение для Telegram на основе анализа Gemma."""
+    """Формирует красивое HTML-сообщение для Telegram на основе анализа Gemini."""
     link = build_order_link(order)
 
     title = analysis.get('title', order.get('topic', 'Без названия'))
@@ -238,7 +208,7 @@ def format_order_message(order, analysis):
     return msg
 
 def main():
-    print("Запуск мониторинга заказов с Gemma 4 31B...")
+    print("Запуск мониторинга заказов с расширенным анализом Gemini...")
     processed = load_processed_ids()
     orders = fetch_orders()
     print(f"Получено заказов: {len(orders)}")
@@ -259,10 +229,10 @@ def main():
             print(f"\nОбработка заказа #{order_id}: {order.get('topic', '')[:50]}...")
             html_content = get_order_html(driver, order)
 
-            analysis = ask_gemma(order, html_content)
+            analysis = ask_gemini(order, html_content)
             if analysis is None:
-                print("  ❌ Не удалось получить анализ от Gemma.")
-                new_processed.add(order_id)  # помечаем как обработанный, чтобы не зацикливаться
+                print("  ❌ Не удалось получить анализ от Gemini.")
+                new_processed.add(order_id)  # всё равно помечаем как обработанный, чтобы не зацикливаться
                 continue
 
             if analysis.get('suitable'):
@@ -275,7 +245,7 @@ def main():
                 print(f"  ❌ Не подходит. Причина: {reason}")
 
             new_processed.add(order_id)
-            time.sleep(4)   # пауза между заказами (15 RPM = 4 сек между запросами)
+            time.sleep(3)   # пауза между заказами
 
     finally:
         driver.quit()
