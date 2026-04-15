@@ -1,5 +1,5 @@
 name: Studwork Monitor with Selenium
-
+on:
   workflow_dispatch:
 
 jobs:
